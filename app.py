@@ -11,9 +11,14 @@
 - 组合C：最小方差优化权重（约束：权重之和 = 1，不允许做空）
 
 数据来源：
-1. 默认：程序内置生成的模拟演示数据（随机种子固定，界面明确标注，不代表任何真实行情）；
-2. 可选：上传 iFinD 导出的 Excel/CSV（须含「时间」与「收盘价(元)」两列，其余列自动忽略）。
-   本版本不读取任何本地数据文件、不联网抓取行情、不包含任何凭据。
+1. 默认：**公开真实数据**——运行时自动从公开渠道获取（沪深300 来自腾讯财经公开行情接口，
+   中债-7-10年国债财富指数来自中国债券信息网），数据仅在会话内存中处理、不入库不入包；
+   已抽样核验公开渠道数据与 iFinD 导出同源一致；
+2. 可选：上传 Excel/CSV（须含「时间」与「收盘价(元)」两列，其余列自动忽略）；
+3. 可选：模拟演示数据（随机种子固定，界面明确标注，不代表任何真实行情）。
+
+⚠️ 合规说明：iFinD 导出数据受授权协议限制、不得公开再分发，因此本部署包
+**不包含、不读取任何 iFinD 导出文件**，仓库中没有任何真实行情数据或凭据。
 
 ⚠️ 债券指数口径（重要）：
 中债-7-10年国债指数 财富指数代码 CBA06501，净价指数 CBA06502，全价指数 CBA06503。
@@ -39,11 +44,16 @@ import pandas as pd
 import streamlit as st
 
 from asset_data_loader import PRICE_NAMES, YTM_NAMES, align_and_calculate, load_ifind_prices
+from public_data import fetch_public_series
 
 TRADING_DAYS = 252
 STOCK_NAME = "沪深300"
 BOND_NAME = "中债7-10年国债指数"
 BOND_CODE = "CBA06501.CB"
+
+SOURCE_PUBLIC = "公开真实数据（自动获取，默认）"
+SOURCE_UPLOAD = "上传的真实数据（请使用获准分享的文件）"
+SOURCE_MOCK = "模拟演示数据（非真实行情）"
 
 # ----------------------- 页面配置 -----------------------
 st.set_page_config(page_title="资产配置分析", page_icon="📊", layout="wide")
@@ -58,14 +68,15 @@ with st.sidebar:
     st.header("1️⃣ 数据来源")
     source = st.radio(
         "选择使用哪套数据",
-        ["模拟演示数据（默认，非真实行情）", "上传的真实数据（请使用获准分享的文件）"],
+        [SOURCE_PUBLIC, SOURCE_UPLOAD, SOURCE_MOCK],
         index=0,
         help=(
-            "云端版默认使用内置的模拟演示数据；如需真实分析，"
-            "请上传你获准使用的 iFinD 导出行情文件。"
+            "默认从公开渠道（腾讯财经行情接口 + 中国债券信息网）自动获取真实历史行情；"
+            "也可上传你获准使用的行情文件，或切换为模拟演示数据。"
         ),
     )
-    use_mock = source.startswith("模拟")
+    use_mock = source == SOURCE_MOCK
+    use_public = source == SOURCE_PUBLIC
 
     st.header("2️⃣ 上传真实数据（可选）")
     st.markdown(
@@ -122,11 +133,35 @@ def make_demo_data() -> tuple[pd.Series, pd.Series]:
     )
 
 
+@st.cache_data(ttl=3600, show_spinner="正在从公开渠道获取真实历史行情…")
+def cached_public_series() -> tuple[pd.Series, pd.Series]:
+    """公开数据源获取结果缓存 1 小时，避免每次会话重复请求。"""
+    return fetch_public_series()
+
+
 meta_stock = meta_bond = None
 stock_source_label = bond_source_label = None
 stock_src = bond_src = None
 
-if use_mock:
+if use_public:
+    try:
+        stock_raw, bond_raw = cached_public_series()
+        stock_raw, bond_raw = stock_raw.copy(), bond_raw.copy()
+    except Exception as exc:
+        st.error(
+            "**公开数据源获取失败，未做任何替代（不会自动切换为模拟数据）。**\n\n"
+            f"错误信息：`{exc}`\n\n"
+            "可能原因：公开接口临时不可用或访问频率受限。请稍后刷新重试；"
+            "或在左侧把「数据来源」切换为「上传的真实数据」/「模拟演示数据」。"
+        )
+        st.stop()
+    stock_source_label = "公开渠道：腾讯财经行情接口（000300.SH）"
+    bond_source_label = "公开渠道：中国债券信息网（中债-7-10年国债指数·财富）"
+    source_desc = (
+        "公开渠道实时获取的真实数据（沪深300：腾讯财经公开行情接口；"
+        f"{BOND_NAME}：中国债券信息网，与中债官网发布口径一致）"
+    )
+elif use_mock:
     stock_raw, bond_raw = make_demo_data()
     source_desc = "模拟演示数据（程序随机生成、种子固定可复现，仅用于演示与教学，不代表任何真实行情）"
     if (up_stock is not None) or (up_bond is not None):
@@ -134,7 +169,7 @@ if use_mock:
             "已上传文件，但当前选择的是**模拟演示数据**，上传的文件不会被读取。"
             "如需使用你上传的数据，请把左侧「数据来源」切换为「上传的真实数据」。"
         )
-else:
+else:  # 上传的真实数据
     stock_src, stock_source_label = (
         up_stock,
         f"上传文件（{up_stock.name}）" if up_stock is not None else None,
@@ -183,8 +218,8 @@ else:
         f"{BOND_NAME}：{bond_source_label}）"
     )
 
-# 债券 YTM：必须显式确认近似口径，才能继续
-if bond_is_ytm and not use_mock and not allow_ytm_approx:
+# 债券 YTM（仅上传模式）：必须显式确认近似口径，才能继续
+if bond_is_ytm and source == SOURCE_UPLOAD and not allow_ytm_approx:
     st.error(
         "**已检测到债券数据类型为「到期收益率 YTM」。**\n\n"
         "到期收益率衡量的是持有到期的年化回报水平（利率），其日度变化不是资产价格回报，"
@@ -194,7 +229,19 @@ if bond_is_ytm and not use_mock and not allow_ytm_approx:
     )
     st.stop()
 
-if use_mock:
+if use_public:
+    st.success(
+        "**当前数据来源：公开真实数据（自动获取）** — "
+        f"{STOCK_NAME} 来自腾讯财经公开行情接口；{BOND_NAME}（财富指数 {BOND_CODE}）来自中国债券信息网。\n\n"
+        f"- {STOCK_NAME}：{len(stock_raw)} 个交易日（{stock_raw.index[0]:%Y-%m-%d} ~ {stock_raw.index[-1]:%Y-%m-%d}）"
+        f"，最新收盘 {stock_raw.iloc[-1]:.2f}\n"
+        f"- {BOND_NAME}：{len(bond_raw)} 个交易日（{bond_raw.index[0]:%Y-%m-%d} ~ {bond_raw.index[-1]:%Y-%m-%d}）"
+        f"，最新值 {bond_raw.iloc[-1]:.4f}\n\n"
+        "数据在每次会话中实时获取（缓存 1 小时），不落盘、不入库。"
+        "抽样核验：与 iFinD 导出同源一致（中债官网数据与授权渠道数据完全一致；"
+        "沪深300 个别交易日可能存在极小数值差异）。"
+    )
+elif use_mock:
     st.warning(
         "**当前数据来源：模拟演示数据**（程序随机生成、种子固定，仅用于演示界面与计算逻辑，"
         f"不代表任何真实行情，请勿据此得出投资结论）。演示区间："
@@ -226,7 +273,17 @@ else:
     )
     st.dataframe(src_table, hide_index=True, width="stretch")
 
-if bond_is_ytm and allow_ytm_approx and not use_mock:
+# YTM 口径仅对上传文件有意义：公开数据源固定为财富指数，不能做 YTM 近似
+if bond_is_ytm and use_public:
+    st.error(
+        "**「债券数据口径」与公开数据源冲突。**\n\n"
+        "公开数据源固定为**财富指数 CBA06501**（含票息再投资），不是到期收益率，"
+        "无需也无法做 YTM 近似。\n\n请把「债券数据口径」改回"
+        "「中债-7-10年国债指数（财富指数）」；如需使用 YTM 数据请切换为上传模式。"
+    )
+    st.stop()
+
+if bond_is_ytm and allow_ytm_approx and source == SOURCE_UPLOAD:
     bond_raw = (1 + bond_raw / 100 / TRADING_DAYS).cumprod()
     bond_label = "国债YTM粗略近似（日收益≈YTM/252，非真实回报）"
     bond_desc = "到期收益率 YTM 粗略近似（仅演示，非含息总回报）"
@@ -234,12 +291,19 @@ else:
     bond_label = BOND_NAME
     bond_desc = f"{BOND_NAME}（财富指数，{BOND_CODE}，含票息再投资）"
 
-if not bond_is_ytm and not use_mock:
-    st.info(
-        f"**债券口径**：中债-7-10年国债指数按中债估值中心编制说明分为 财富指数 {BOND_CODE}、"
-        "净价指数 CBA06502、全价指数 CBA06503。财富指数以全价计算并计入票息再投资，"
-        "可作为**含息总回报**口径；净价指数不含应计利息，两者不可混用。"
-    )
+if not bond_is_ytm:
+    if use_public:
+        st.info(
+            f"**债券口径**：公开数据源为中国债券信息网「中债-7-10年国债指数·财富指数」"
+            f"（即 {BOND_CODE}），以全价计算并计入票息再投资，为**含息总回报**口径；"
+            "净价指数 CBA06502 不含应计利息，两者不可混用。"
+        )
+    else:
+        st.info(
+            f"**债券口径**：中债-7-10年国债指数按中债估值中心编制说明分为 财富指数 {BOND_CODE}、"
+            "净价指数 CBA06502、全价指数 CBA06503。财富指数以全价计算并计入票息再投资，"
+            "可作为**含息总回报**口径；净价指数不含应计利息，两者不可混用。"
+        )
 
 # ----------------------- 对齐与区间 -----------------------
 try:
@@ -426,11 +490,17 @@ with pd.ExcelWriter(buffer, engine="xlsxwriter") as writer:
                 "债券数据类型", "统计区间", "导出时间",
             ],
             "内容": [
-                "模拟演示数据（非真实行情）" if use_mock else "上传的真实数据（用户自行提供）",
-                "—（模拟演示数据）" if use_mock else f"{stock_src.name}｜{stock_source_label}",
-                "—（模拟演示数据）" if use_mock else f"{meta_stock['rows']} 个",
-                "—（模拟演示数据）" if use_mock else f"{bond_src.name}｜{bond_source_label}",
-                "—（模拟演示数据）" if use_mock else f"{meta_bond['rows']} 个",
+                "模拟演示数据（非真实行情）" if use_mock
+                else "公开渠道实时获取的真实数据" if use_public
+                else "上传的真实数据（用户自行提供）",
+                "—（模拟演示数据）" if use_mock else stock_source_label,
+                "—（模拟演示数据）" if use_mock
+                else f"{len(stock_raw)} 个" if use_public
+                else f"{meta_stock['rows']} 个",
+                "—（模拟演示数据）" if use_mock else bond_source_label,
+                "—（模拟演示数据）" if use_mock
+                else f"{len(bond_raw)} 个" if use_public
+                else f"{meta_bond['rows']} 个",
                 f"{len(prices_all)} 个（{prices_all.index[0]:%Y-%m-%d} ~ {prices_all.index[-1]:%Y-%m-%d}）",
                 f"{wA_s:.0%} / {wA_b:.0%}",
                 f"{wB_s:.0%} / {wB_b:.0%}",
@@ -459,7 +529,8 @@ st.download_button(
 
 st.markdown("---")
 st.caption(
-    "免责声明：本应用为公开演示版，默认使用程序生成的模拟演示数据（非真实行情）；"
-    "不联网抓取行情、不存储任何用户数据，上传文件仅在当次会话内存中处理。"
+    "免责声明：本应用默认从公开渠道（腾讯财经行情接口、中国债券信息网）实时获取真实历史行情"
+    "（缓存 1 小时），也可切换为模拟演示数据（非真实行情）；不使用、不存储、不公开再分发任何"
+    "受授权限制的数据（如 iFinD 导出数据）；上传文件仅在当次会话内存中处理，不存储任何用户数据。"
     "所有结果仅供研究与教学参考，不构成投资建议。"
 )
